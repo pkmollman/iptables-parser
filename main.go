@@ -8,6 +8,8 @@ import (
 	"log"
 	"os"
 	"strings"
+
+	"golang.org/x/exp/slices"
 )
 
 type IptablesRule struct {
@@ -33,9 +35,8 @@ func dlog(debugString string) {
 }
 
 var usageString = `Usage: iptables-parser [options]
-Parse iptables rules and output them as JSON or a human readable format (TODO).
-They may be parsed from a single file (TODO), or a directory. When a directory is specified,
-all top-level files in the directory will be parsed. Subdirectories are ignored.
+Parse iptables rules and output them as JSON.
+All top-level files in the directory will be parsed. Subdirectories are ignored.
 See github.com/pkmollman/iptables-parser for more information.
 `
 
@@ -53,6 +54,9 @@ func main() {
 
 	flag.BoolVar(&debug, "debug", false, "Turn on debug messages")
 
+	var nsxJson bool
+	flag.BoolVar(&nsxJson, "nsx", false, "Output NSX API rule objects instead of generic iptables-parser JSON")
+
 	flag.Parse()
 
 	files, err := os.ReadDir(iptablesFragmentDir)
@@ -61,6 +65,7 @@ func main() {
 	}
 
 	rules := []IptablesRule{}
+	nsxRules := []nsxRule{}
 
 	for _, file := range files {
 		if !file.IsDir() {
@@ -79,10 +84,23 @@ func main() {
 					if err == nil {
 						rule.FragmentName = file.Name()
 						rules = append(rules, rule)
+						if nsxJson {
+							nsxRules = append(nsxRules, nsxRule{}.NewFromIptablesRule(rule))
+						}
 					}
 				}
 			}
 		}
+	}
+
+	if nsxJson {
+		nsxRules = collapseNsxRules(nsxRules)
+		nsxJson, err := json.Marshal(nsxRules)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println(string(nsxJson))
+		return
 	}
 
 	rulesJson, err := json.Marshal(rules)
@@ -233,4 +251,117 @@ func parseIptablesRule(rule string) (IptablesRule, error) {
 	}
 
 	return iptRule, nil
+}
+
+type L4PortSetServiceEntry struct {
+	// TCP or UDP
+	Protocol         string   `json:"l4_protocol"`
+	SourcePorts      []string `json:"source_ports,omitempty"`
+	DestinationPorts []string `json:"destination_ports,omitempty"`
+	// single port or port range (e.g. 80 or 80-90)
+	ResourceType string `json:"resource_type"`
+}
+
+type nsxRule struct {
+	Name              string                  `json:"display_name,omitempty"`
+	SourceGroups      []string                `json:"source_groups,omitempty"`
+	DestinationGroups []string                `json:"destination_groups,omitempty"`
+	Scope             string                  `json:"scope,omitempty"`
+	Services          []string                `json:"services,omitempty"`
+	ServiceEntries    []L4PortSetServiceEntry `json:"service_entries,omitempty"`
+	// ACCEPT, REJECT, DROP
+	Action       string `json:"action,omitempty"`
+	Logged       bool   `json:"logged,omitempty"`
+	ResourceType string `json:"resource_type"`
+}
+
+func (nsxRule) NewFromIptablesRule(iptRule IptablesRule) nsxRule {
+	newRule := nsxRule{Name: fmt.Sprintf("%s-%s_%s", iptRule.FragmentName, iptRule.Protocol, iptRule.DestinationPort), ResourceType: "Rule", Logged: true}
+
+	if iptRule.Source != "" {
+		newRule.SourceGroups = []string{iptRule.Source}
+	} else {
+		newRule.SourceGroups = []string{"ANY"}
+	}
+
+	destPorts := stringToPorts(iptRule.DestinationPort)
+	sourcePorts := stringToPorts(iptRule.SourcePort)
+	serviceProtocol := strings.ToUpper(iptRule.Protocol)
+
+	if serviceProtocol != "TCP" && serviceProtocol != "UDP" && serviceProtocol != "" {
+		log.Println(iptRule)
+		log.Fatalln("Unsupported protocol: ", iptRule.Protocol)
+	}
+
+	if serviceProtocol != "" {
+		newRule.ServiceEntries = []L4PortSetServiceEntry{
+			{
+				Protocol:         serviceProtocol,
+				SourcePorts:      sourcePorts,
+				DestinationPorts: destPorts,
+				ResourceType:     "L4PortSetServiceEntry",
+			},
+		}
+	}
+	newRule.Services = []string{"ANY"}
+
+	switch iptRule.Jump {
+	case "ALLOW", "ACCEPT":
+		newRule.Action = "ALLOW"
+	case "REJECT":
+		newRule.Action = "REJECT"
+	case "DROP":
+		newRule.Action = "DROP"
+	default:
+		log.Fatalln("Unsupported jump: ", iptRule.Jump)
+	}
+
+	return newRule
+}
+
+func stringToPorts(portString string) []string {
+	ports := []string{}
+	splitPorts := strings.Split(portString, ",")
+	for _, port := range splitPorts {
+		if port == "" {
+			continue
+		}
+		if strings.Contains(port, ":") {
+			portRange := strings.Split(port, ":")
+			ports = append(ports, portRange[0]+"-"+portRange[1])
+		} else {
+			ports = append(ports, port)
+		}
+	}
+	return ports
+}
+
+// combine rules with the same action and name, and the same destination service entries
+func collapseNsxRules(rules []nsxRule) []nsxRule {
+	collapsedRules := []nsxRule{}
+	handledIndexes := []int{}
+
+	for mainIndex, mainRule := range rules {
+		if !slices.Contains(handledIndexes, mainIndex) {
+			for subIndex, subRule := range rules {
+				if mainIndex != subIndex && !slices.Contains(handledIndexes, subIndex) {
+					if mainRule.Action == subRule.Action && mainRule.Name == subRule.Name {
+						for _, mainRuleService := range mainRule.ServiceEntries {
+							for _, subRuleService := range subRule.ServiceEntries {
+								if slices.Compare(mainRuleService.SourcePorts, subRuleService.SourcePorts) == 0 && slices.Compare(mainRuleService.DestinationPorts, subRuleService.DestinationPorts) == 0 && mainRuleService.Protocol == subRuleService.Protocol {
+									mainRule.SourceGroups = append(mainRule.SourceGroups, subRule.SourceGroups...)
+									handledIndexes = append(handledIndexes, subIndex)
+								}
+							}
+						}
+					}
+				}
+			}
+			collapsedRules = append(collapsedRules, mainRule)
+			handledIndexes = append(handledIndexes, mainIndex)
+		}
+	}
+
+	return collapsedRules
+
 }
